@@ -1,0 +1,112 @@
+#!/bin/zsh
+set -u
+
+APP_NAME="TMWatch"
+BASE_DIR="${HOME}/Library/Application Support/TMWatch"
+CONFIG_FILE="${BASE_DIR}/config.env"
+LOG_DIR="${BASE_DIR}/logs"
+STATE_DIR="${BASE_DIR}/state"
+LOG_FILE="${LOG_DIR}/tmwatch.log"
+DETAILS_FILE="${STATE_DIR}/last_details.txt"
+STATUS_FILE="${STATE_DIR}/last_status.txt"
+LOCK_DIR="${STATE_DIR}/check.lock"
+
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+
+THRESHOLD_GIB=25
+CHECK_TIMEOUT_SECONDS=3600
+NOTIFY_COOLDOWN_SECONDS=21600
+TOP_ITEMS=15
+SOUND_NAME="Basso"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  source "$CONFIG_FILE"
+fi
+
+log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
+
+notify() {
+  local title="$1" subtitle="$2" message="$3"
+  /usr/bin/osascript >/dev/null 2>&1 <<EOF
+display notification "${message//\"/\\\"}" with title "${title//\"/\\\"}" subtitle "${subtitle//\"/\\\"}" sound name "${SOUND_NAME//\"/\\\"}"
+EOF
+}
+
+human_to_bytes() {
+  local value="$1"
+  /usr/bin/awk -v s="$value" 'BEGIN { if (s == "" || s == "0B") { print 0; exit } unit=substr(s,length(s),1); num=substr(s,1,length(s)-1)+0; mult=1; if(unit=="K")mult=1024; else if(unit=="M")mult=1024^2; else if(unit=="G")mult=1024^3; else if(unit=="T")mult=1024^4; else if(unit=="P")mult=1024^5; else if(unit=="B"){num=substr(s,1,length(s)-1)+0;mult=1}else{num=s+0;mult=1}; printf "%.0f\n",num*mult }'
+}
+
+bytes_to_human() {
+  local bytes="$1"
+  /usr/bin/awk -v b="$bytes" 'BEGIN { split("B KiB MiB GiB TiB PiB",u," "); i=1; while(b>=1024 && i<6){b/=1024;i++}; if(i==1)printf "%.0f %s",b,u[i]; else printf "%.2f %s",b,u[i] }'
+}
+
+threshold_bytes() { /usr/bin/awk -v g="$THRESHOLD_GIB" 'BEGIN { printf "%.0f\n", g*1024*1024*1024 }'; }
+tm_running() { /usr/bin/tmutil status 2>/dev/null | /usr/bin/grep -q 'Running = 1'; }
+latest_backup() { /usr/bin/tmutil latestbackup 2>/dev/null | /usr/bin/tail -n 1; }
+parse_summary_value() { local label="$1" file="$2"; /usr/bin/awk -v label="$label" '$1 == label ":" { print $2; exit }' "$file"; }
+
+write_top_items() {
+  local raw_file="$1"
+  { print; print "Largest added/changed items:"; /usr/bin/awk '/^[+!][[:space:]]/ { size=$2; $1="";$2=""; sub(/^[[:space:]]+/,"",$0); if(size~/^[0-9.]+[BKMGTP]$/){unit=substr(size,length(size),1);n=substr(size,1,length(size)-1)+0;m=1;if(unit=="K")m=1024;else if(unit=="M")m=1024^2;else if(unit=="G")m=1024^3;else if(unit=="T")m=1024^4;else if(unit=="P")m=1024^5;printf "%.0f\t%s\t%s\n",n*m,size,$0}}' "$raw_file" | /usr/bin/sort -nr | /usr/bin/head -n "$TOP_ITEMS" | /usr/bin/awk -F '\t' '{printf "  %-10s %s\n",$2,$3}'; } >> "$DETAILS_FILE"
+}
+
+check_now() {
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then log "Check skipped: another check is running."; print "TMWatch check already running."; return 0; fi
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+  if tm_running; then log "Check skipped: Time Machine is running."; print "Time Machine is currently backing up; TMWatch skipped this check."; return 0; fi
+  local latest="$(latest_backup)"
+  if [[ -z "$latest" ]]; then log "No latest backup found."; print "TMWatch could not locate a previous Time Machine backup."; return 2; fi
+  local raw_file="$(mktemp -t tmwatch.XXXXXX)"
+  trap 'rm -f "$raw_file"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT INT TERM
+  log "Starting tmutil compare -s against $latest"
+  /usr/bin/perl -e 'my $timeout=shift @ARGV; $SIG{ALRM}=sub{die "TMWATCH_TIMEOUT\n"}; alarm($timeout); exec @ARGV;' "$CHECK_TIMEOUT_SECONDS" /usr/bin/tmutil compare -s >"$raw_file" 2>&1
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    if /usr/bin/grep -q TMWATCH_TIMEOUT "$raw_file"; then log "Check timed out."; print "TMWatch compare timed out after ${CHECK_TIMEOUT_SECONDS} seconds."; else log "tmutil compare failed ($rc)."; print "tmutil compare failed. The most common cause is missing Full Disk Access."; print; tail -n 10 "$raw_file"; fi
+    return "$rc"
+  fi
+  local added_h="$(parse_summary_value Added "$raw_file")" removed_h="$(parse_summary_value Removed "$raw_file")" changed_h="$(parse_summary_value Changed "$raw_file")"
+  if [[ -z "$added_h" || -z "$changed_h" ]]; then log "Could not parse summary."; print "TMWatch could not parse the tmutil results."; tail -n 20 "$raw_file"; return 3; fi
+  local added_b="$(human_to_bytes "$added_h")" removed_b="$(human_to_bytes "${removed_h:-0B}")" changed_b="$(human_to_bytes "$changed_h")"
+  local pending_b=$((added_b + changed_b)) limit_b="$(threshold_bytes)" pending_h="$(bytes_to_human $((added_b + changed_b)))"
+  { print "TMWatch report"; print "Generated: $(date)"; print "Latest backup: $latest"; print; print "Added:   $added_h"; print "Changed: $changed_h"; print "Removed: ${removed_h:-0B}"; print "Estimated data to write (Added + Changed): $pending_h"; print "Alert threshold: ${THRESHOLD_GIB} GiB"; } > "$DETAILS_FILE"
+  write_top_items "$raw_file"
+  local state="OK"; (( pending_b >= limit_b )) && state="WARNING"
+  { print "State: $state"; print "Estimated pending: $pending_h"; print "Threshold: ${THRESHOLD_GIB} GiB"; print "Checked: $(date)"; } > "$STATUS_FILE"
+  log "Check complete: state=$state added=$added_h changed=$changed_h removed=${removed_h:-0B} estimated=$pending_h"
+  if [[ "$state" == WARNING ]]; then
+    local now="$(date +%s)" last_alert=0 alert_state="${STATE_DIR}/last_alert_epoch"
+    [[ -f "$alert_state" ]] && last_alert="$(cat "$alert_state" 2>/dev/null || print 0)"
+    if (( now-last_alert >= NOTIFY_COOLDOWN_SECONDS )); then notify "Time Machine Backup Warning" "$pending_h appears pending" "TMWatch threshold is ${THRESHOLD_GIB} GiB. Run tmwatch details."; print "$now" > "$alert_state"; log "Warning notification sent."; else log "Warning suppressed by cooldown."; fi
+  fi
+  cat "$STATUS_FILE"
+}
+
+show_status() { [[ -f "$STATUS_FILE" ]] && cat "$STATUS_FILE" || print "No TMWatch check has completed yet."; }
+show_details() { [[ -f "$DETAILS_FILE" ]] && cat "$DETAILS_FILE" || print "No TMWatch details are available yet."; }
+show_log() { [[ -f "$LOG_FILE" ]] && tail -n 100 "$LOG_FILE" || print "No TMWatch log exists yet."; }
+
+case "${1:-check}" in
+  check) check_now ;;
+  status) show_status ;;
+  details) show_details ;;
+  log) show_log ;;
+  test-notification) notify "TMWatch Test" "Notifications are working" "TMWatch can alert you before an unusually large backup."; print "Test notification sent." ;;
+  config) print "$CONFIG_FILE" ;;
+  help|-h|--help) cat <<'EOF'
+TMWatch — Time Machine preflight size watcher
+
+Usage:
+  tmwatch check              Run a comparison now
+  tmwatch status             Show the most recent result
+  tmwatch details            Show totals and largest changed/added items
+  tmwatch log                Show the last 100 log lines
+  tmwatch test-notification  Send a macOS test notification
+  tmwatch config             Print the configuration file path
+  tmwatch help               Show this help
+EOF
+  ;;
+  *) print "Unknown command: $1"; print "Run: tmwatch help"; exit 1 ;;
+esac
